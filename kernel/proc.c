@@ -158,6 +158,7 @@ freeproc(struct proc *p)
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->trace_mask=0;
   p->parent = 0;
   p->name[0] = 0;
   p->chan = 0;
@@ -302,6 +303,7 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+  np->trace_mask=p->trace_mask;
 
   pid = np->pid;
 
@@ -653,4 +655,20 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+uint64
+count_nonused_procs(void)
+{
+  struct proc *p;
+  uint64 count = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+      count++;
+    }
+    release(&p->lock);
+  }
+
+  return count;
 }

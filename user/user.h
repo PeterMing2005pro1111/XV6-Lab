@@ -1,7 +1,8 @@
 struct stat;
 struct rtcdate;
-
+struct sysinfo;
 // system calls
+int sysinfo(struct sysinfo *);
 int fork(void);
 int exit(int) __attribute__((noreturn));
 int wait(int*);
@@ -40,3 +41,4 @@ void free(void*);
 int atoi(const char*);
 int memcmp(const void *, const void *, uint);
 void *memcpy(void *, const void *, uint);
+int trace(int);

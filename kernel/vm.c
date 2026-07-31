@@ -339,7 +339,42 @@ uvmclear(pagetable_t pagetable, uint64 va)
     panic("uvmclear");
   *pte &= ~PTE_U;
 }
+void
+vmprint_level(pagetable_t pagetable, int level)
+{
+  // 每个页表包含 512 个页表项 (PTE)
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    
+    // 只处理有效的 PTE
+    if(pte & PTE_V){
+      uint64 pa = PTE2PA(pte);
 
+      // 根据当前深度打印缩进
+      if(level == 0) {
+        printf("..%d: pte %p pa %p\n", i, pte, pa);
+      } else if(level == 1) {
+        printf(".. ..%d: pte %p pa %p\n", i, pte, pa);
+      } else if(level == 2) {
+        printf(".. .. ..%d: pte %p pa %p\n", i, pte, pa);
+      }
+
+      // 如果当前 PTE 不是叶子节点（即指向下一级页表）
+      // RISC-V 中：如果 R, W, X 均为 0，表示指向下一级页表
+      if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
+        vmprint_level((pagetable_t)pa, level + 1);
+      }
+    }
+  }
+}
+
+// 主入口函数
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprint_level(pagetable, 0);
+}
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.

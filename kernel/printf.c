@@ -113,7 +113,22 @@ printf(char *fmt, ...)
   if(locking)
     release(&pr.lock);
 }
+void
+backtrace(void)
+{
+  uint64 fp = r_fp();               //获取当前函数的栈帧指针
+  uint64 top = PGROUNDUP(fp);       //当前内核栈页面的顶部边界
+  uint64 bottom = PGROUNDDOWN(fp);  //当前内核栈页面的底部边界
 
+  printf("backtrace:\n");
+  
+  // 只要 fp 在当前的内核栈页面范围内，就继续向上回溯
+  while (fp >= bottom && fp < top) {
+    uint64 ra = *(uint64*)(fp - 8);
+    printf("%p\n", ra);
+    fp = *(uint64*)(fp - 16);
+  }
+}
 void
 panic(char *s)
 {
@@ -121,6 +136,7 @@ panic(char *s)
   printf("panic: ");
   printf(s);
   printf("\n");
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;

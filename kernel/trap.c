@@ -78,7 +78,22 @@ usertrap(void)
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
-    yield();
+{
+  if(p->alarm_interval > 0) {
+    p->alarm_ticks++;
+    if(p->alarm_ticks >= p->alarm_interval && !p->alarm_goingoff) {
+      p->alarm_goingoff = 1;
+      p->alarm_ticks = 0;
+
+      // 备份整个 trapframe 结构体
+      p->alarm_tf = *p->trapframe;
+
+      // 然后再修改 epc 指向 handler 逻辑
+      p->trapframe->epc = (uint64)p->alarm_handler;
+    }
+  }
+  yield();
+}
 
   usertrapret();
 }

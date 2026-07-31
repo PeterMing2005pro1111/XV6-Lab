@@ -140,6 +140,11 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->alarm_interval = 0;
+  p->alarm_handler = 0;
+  p->alarm_ticks = 0;
+  p->alarm_goingoff = 0;
+  memset(&p->alarm_tf, 0, sizeof(p->alarm_tf));
 
   return p;
 }
@@ -302,7 +307,11 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
-
+  np->alarm_interval = p->alarm_interval;
+  np->alarm_handler = p->alarm_handler;
+  np->alarm_ticks = 0;         // 新进程 ticks 从 0 开始计算
+  np->alarm_goingoff = 0;      // 确保子进程初始不处于 alarm 处理状态
+np->alarm_tf = p->alarm_tf;
   pid = np->pid;
 
   release(&np->lock);

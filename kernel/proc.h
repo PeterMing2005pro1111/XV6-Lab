@@ -105,4 +105,10 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  int alarm_interval;          // 警报触发间隔（0表示禁用）
+  void (*alarm_handler)();     // 用户指定的警报处理函数指针
+  int alarm_ticks;             // 自上次触发以来经历的计数
+  
+  int alarm_goingoff;          // 标志位：当前是否正在执行handler（防止重复触发/嵌套）
+  struct trapframe alarm_tf;   // 用于保存触发中断时的完整trapframe副本
 };

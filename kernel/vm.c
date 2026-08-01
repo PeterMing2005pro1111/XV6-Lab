@@ -303,7 +303,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,14 +310,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+
+    // 如果物理页是可写的，清除 PTE_W 并标记 PTE_COW
+    if(*pte & PTE_W){
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // 将子进程页表也映射到相同物理页
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    
+    // 递增物理页引用计数
+    kref_inc((void*)pa);
   }
   return 0;
 
@@ -339,7 +344,39 @@ uvmclear(pagetable_t pagetable, uint64 va)
     panic("uvmclear");
   *pte &= ~PTE_U;
 }
+int
+cow_alloc(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA)
+    return -1;
 
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 || (*pte & PTE_COW) == 0)
+    return -1;
+
+  uint64 pa = PTE2PA(*pte);
+
+  // 为故障进程分配新物理页
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  // 复制原物理页内容
+  memmove(mem, (char*)pa, PGSIZE);
+
+  // 调整权限：加上 PTE_W，清除 PTE_COW
+  uint flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+
+  // 重新映射到新物理页
+  *pte = PA2PTE(mem) | flags;
+
+  // 原物理页引用计数递减
+  kfree((void*)pa);
+
+  return 0;
+}
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -347,9 +384,23 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(va0 >= MAXVA)
+      return -1;
+
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+
+    // 如果该地址是 COW 物理页，手动触发复制分配
+    if(*pte & PTE_COW){
+      if(cow_alloc(pagetable, va0) < 0)
+        return -1;
+    }
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;

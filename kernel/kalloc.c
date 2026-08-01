@@ -8,7 +8,12 @@
 #include "spinlock.h"
 #include "riscv.h"
 #include "defs.h"
-
+#define PA2INDEX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+#define MAX_PAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+struct {
+  struct spinlock lock;
+  int count[MAX_PAGES];
+} ref_cnt;
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -27,6 +32,7 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&ref_cnt.lock, "ref_cnt");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,7 +56,14 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
-
+acquire(&ref_cnt.lock);
+  if(ref_cnt.count[PA2INDEX(pa)] > 1) {
+    ref_cnt.count[PA2INDEX(pa)]--;
+    release(&ref_cnt.lock);
+    return; // 还有其他进程在使用，不释放物理页
+  }
+  ref_cnt.count[PA2INDEX(pa)] = 0;
+  release(&ref_cnt.lock);
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -77,6 +90,20 @@ kalloc(void)
   release(&kmem.lock);
 
   if(r)
+  {
+    acquire(&ref_cnt.lock);
+    ref_cnt.count[PA2INDEX(r)] = 1;
+    release(&ref_cnt.lock);
     memset((char*)r, 5, PGSIZE); // fill with junk
+  }
   return (void*)r;
+}
+void
+kref_inc(void *pa)
+{
+  if((uint64)pa < KERNBASE || (uint64)pa >= PHYSTOP)
+    return;
+  acquire(&ref_cnt.lock);
+  ref_cnt.count[PA2INDEX(pa)]++;
+  release(&ref_cnt.lock);
 }

@@ -374,45 +374,109 @@ iunlockput(struct inode *ip)
 
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
+
 static uint
 bmap(struct inode *ip, uint bn)
 {
   uint addr, *a;
   struct buf *bp;
 
+  // 1. 直接块 (0..NDIRECT-1)
   if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
+    if((addr = ip->addrs[bn]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0) return 0;
+      ip->addrs[bn] = addr;
+    }
     return addr;
   }
   bn -= NDIRECT;
 
+  // 2. 一级间接块 (NDIRECT .. NDIRECT + NINDIRECT - 1)
   if(bn < NINDIRECT){
-    // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+    // 加载/分配一级间接块
+    if((addr = ip->addrs[NDIRECT]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0) return 0;
+      ip->addrs[NDIRECT] = addr;
+      iupdate(ip); 
+    }
+    
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+      addr = balloc(ip->dev);
+      if(addr){
+        a[bn] = addr;
+        log_write(bp);
+      }
     }
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
+
+  // 3. 二级间接块 (Double indirect block)
+  if(bn < NINDIRECT * NINDIRECT){
+    // (a) 获取/分配 二级主索引块 (ip->addrs[NDIRECT + 1])
+    if((addr = ip->addrs[NDIRECT + 1]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0) return 0;
+      ip->addrs[NDIRECT + 1] = addr;
+      iupdate(ip); 
+    }
+    
+    uint idx1 = bn / NINDIRECT; // 第一层索引 (0..255)
+    uint idx2 = bn % NINDIRECT; // 第二层索引 (0..255)
+
+    // (b) 读取主表，获取/分配 一层索引块
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    uint addr2 = a[idx1];
+    
+    if(addr2 == 0){
+      // 分配前先释放 bp，避免持着 bp 去 balloc -> bzero -> bread 造成锁冲突
+      addr2 = balloc(ip->dev);
+      if(addr2 == 0){
+        brelse(bp);
+        return 0;
+      }
+      a[idx1] = addr2;
+      log_write(bp);
+    }
+    brelse(bp); // 及时释放主表
+
+    // (c) 读取二级表，获取/分配 最终数据块
+    struct buf *bp2 = bread(ip->dev, addr2);
+    uint *a2 = (uint*)bp2->data;
+    uint data_addr = a2[idx2];
+
+    if(data_addr == 0){
+      data_addr = balloc(ip->dev);
+      if(data_addr){
+        a2[idx2] = data_addr;
+        log_write(bp2);
+      }
+    }
+    brelse(bp2); // 及时释放二级表
+
+    return data_addr;
+  }
 
   panic("bmap: out of range");
 }
-
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
+// kernel/fs.c
+
 void
 itrunc(struct inode *ip)
 {
   int i, j;
-  struct buf *bp;
-  uint *a;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
 
+  //释放直接块
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -420,6 +484,7 @@ itrunc(struct inode *ip)
     }
   }
 
+  //释放一级间接块及其下的数据块
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
@@ -430,6 +495,30 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  //释放二级间接块、其下的所有一级间接块及所有数据块
+  if(ip->addrs[NDIRECT + 1]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    a = (uint*)bp->data;
+    
+    // 遍历二级索引主表中的 256 项
+    for(i = 0; i < NINDIRECT; i++){
+      if(a[i]){
+        // 读取每一项对应的一级间接块
+        bp2 = bread(ip->dev, a[i]);
+        a2 = (uint*)bp2->data;
+        for(j = 0; j < NINDIRECT; j++){
+          if(a2[j])
+            bfree(ip->dev, a2[j]); // 释放数据块
+        }
+        brelse(bp2);
+        bfree(ip->dev, a[i]); // 释放中间索引块
+      }
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT + 1]); // 释放主索引块
+    ip->addrs[NDIRECT + 1] = 0;
   }
 
   ip->size = 0;

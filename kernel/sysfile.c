@@ -292,7 +292,8 @@ sys_open(void)
   struct inode *ip;
   int n;
 
-  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+  argint(1, &omode);
+  if((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
 
   begin_op();
@@ -316,10 +317,38 @@ sys_open(void)
     }
   }
 
-  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
-    iunlockput(ip);
-    end_op();
-    return -1;
+  // 如果没有传入 O_NOFOLLOW 标志，则跟随并递归解包符号链接
+  if((omode & O_NOFOLLOW) == 0){
+    int depth = 0;
+    char target[MAXPATH];
+
+    // 循环追踪软链接，直到找到实体文件
+    while(ip->type == T_SYMLINK){
+      if(depth >= 10){ // 防止软链接自环 (如 A -> B -> A) 导致死循环
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      depth++;
+
+      // 读取软链接数据块里存的目标路径
+      if(readi(ip, 0, (uint64)target, 0, ip->size) != ip->size){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      target[ip->size] = '\0'; // 手动加上字符串结束符 '\0'
+
+      // 必须先解锁并释放当前的软链接 inode，防止死锁
+      iunlockput(ip);
+
+      // 根据读取到的目标路径查找新的 inode
+      if((ip = namei(target)) == 0){
+        end_op();
+        return -1; // 目标文件不存在，打开失败
+      }
+      ilock(ip);
+    }
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
@@ -482,5 +511,35 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  // 从用户空间解析两个参数：target(目标路径) 和 path(快捷方式路径)
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  // 创建一个类型为 T_SYMLINK 的新 inode
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  // 将 target 路径字符串写进这个 inode 的数据块里存储
+  if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
   return 0;
 }

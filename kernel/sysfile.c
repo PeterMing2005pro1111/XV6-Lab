@@ -484,3 +484,112 @@ sys_pipe(void)
   }
   return 0;
 }
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, fd, offset;
+  struct file *f;
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  if (argfd(4, &fd, &f) < 0)
+    return -1;
+  argint(5, &offset);
+
+  if (!f->readable && (prot & PROT_READ))
+    return -1;
+  if (!f->writable && (prot & PROT_WRITE) && (flags == MAP_SHARED))
+    return -1;
+
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  // 找一个空闲的 VMA 结构体
+  for (int i = 0; i < NVMA; i++) {
+    if (!p->vmas[i].used) {
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if (!v)
+    return -1;
+
+  // 寻找一块未使用的虚拟地址空间（从 0x40000000 开始往上找）
+  uint64 mmap_addr = 0x40000000;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vmas[i].used && p->vmas[i].addr + p->vmas[i].len > mmap_addr) {
+      mmap_addr = p->vmas[i].addr + p->vmas[i].len;
+    }
+  }
+
+  mmap_addr = PGROUNDUP(mmap_addr);
+
+  v->used = 1;
+  v->addr = mmap_addr;
+  v->len = length;
+  v->prot = prot;
+  v->flags = flags;
+  v->vfile = filedup(f);
+  v->offset = offset;
+
+  // ⚠️ 注意：绝不能修改 p->sz ！
+  return v->addr;
+}
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+
+  argaddr(0, &addr);
+  argint(1, &length);
+
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vmas[i].used && addr >= p->vmas[i].addr && addr < p->vmas[i].addr + p->vmas[i].len) {
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if (!v)
+    return -1;
+
+  if (addr != v->addr && (addr + length) != (v->addr + v->len))
+    return -1;
+
+  uint64 old_vma_addr = v->addr;
+
+  for (uint64 a = addr; a < addr + length; a += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, a, 0);
+    if (pte && (*pte & PTE_V)) {
+      if ((v->flags & MAP_SHARED) && v->vfile->writable && (*pte & PTE_D)) {
+        uint64 va_off = a - old_vma_addr;
+        begin_op();
+        ilock(v->vfile->ip);
+        writei(v->vfile->ip, 1, a, v->offset + va_off, PGSIZE);
+        iunlock(v->vfile->ip);
+        end_op();
+      }
+      uvmunmap(p->pagetable, a, 1, 1);
+    }
+  }
+
+  if (addr == v->addr) {
+    v->addr += length;
+    v->len -= length;
+  } else {
+    v->len -= length;
+  }
+
+  if (v->len == 0) {
+    fileclose(v->vfile);
+    v->used = 0;
+  }
+
+  return 0;
+}

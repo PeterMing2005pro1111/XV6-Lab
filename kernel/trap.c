@@ -5,7 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-
+#include "sleeplock.h" 
+#include "fs.h"        
+#include "file.h"      
+#include "fcntl.h"     
 struct spinlock tickslock;
 uint ticks;
 
@@ -41,32 +44,68 @@ usertrap(void)
   if((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
-  // send interrupts and exceptions to kerneltrap(),
-  // since we're now in the kernel.
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
-  // save user program counter.
   p->trapframe->epc = r_sepc();
   
-  if(r_scause() == 8){
-    // system call
-
+  uint64 scause = r_scause();
+  if(scause == 8){
     if(p->killed)
       exit(-1);
-
-    // sepc points to the ecall instruction,
-    // but we want to return to the next instruction.
     p->trapframe->epc += 4;
-
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
     intr_on();
-
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // ok
+    // 外设中断已在 devintr 中处理，which_dev 记录设备类型
+  } else if(scause == 13 || scause == 15){
+    uint64 va = r_stval();
+    if(va >= MAXVA){
+      p->killed = 1;
+    } else {
+      struct vma *v = 0;
+      for(int i = 0; i < NVMA; i++){
+        if(p->vmas[i].used && va >= p->vmas[i].addr && va < p->vmas[i].addr + p->vmas[i].len){
+          v = &p->vmas[i];
+          break;
+        }
+      }
+
+      // 如果找不到 VMA，或者发起了写操作 (scause==15) 但 VMA 不可写，判定非法访问
+      if(v == 0 || (scause == 15 && !(v->prot & PROT_WRITE))){
+        p->killed = 1;
+      } else {
+        char *mem = kalloc();
+        if(mem == 0){
+          p->killed = 1;
+        } else {
+          memset(mem, 0, PGSIZE);
+          uint64 page_va = PGROUNDDOWN(va);
+          uint64 off = page_va - v->addr + v->offset;
+
+          // 计算本页需要从文件中读取的实际有效长度
+          uint64 read_len = PGSIZE;
+          if(off + read_len > v->offset + v->len){
+            read_len = (v->offset + v->len) - off;
+          }
+          
+          ilock(v->vfile->ip);
+          readi(v->vfile->ip, 0, (uint64)mem, off, read_len);
+          iunlock(v->vfile->ip);
+
+          int perm = PTE_U;
+          if(v->prot & PROT_READ)
+            perm |= PTE_R;
+          if(v->prot & PROT_WRITE)
+            perm |= PTE_W;
+
+          if(mappages(p->pagetable, page_va, PGSIZE, (uint64)mem, perm) != 0){
+            kfree(mem);
+            p->killed = 1;
+          }
+        }
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
@@ -76,13 +115,12 @@ usertrap(void)
   if(p->killed)
     exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
+  // 关键修正：使用 devintr() 返回的 which_dev 判断时钟中断，触发 CPU 抢占！
   if(which_dev == 2)
     yield();
 
   usertrapret();
 }
-
 //
 // return to user space
 //

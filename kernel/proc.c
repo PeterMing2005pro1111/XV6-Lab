@@ -5,7 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-
+#include "fcntl.h"
+#include "sleeplock.h" 
+#include "fs.h"       
+#include "file.h"
+struct file;
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -139,7 +143,12 @@ found:
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
+  p->context.sp = (uint64)p->trapframe + PGSIZE;
+
+  // Clear VMAs
+  for(int i = 0; i < NVMA; i++){
+    p->vmas[i].used = 0;
+  }
 
   return p;
 }
@@ -302,7 +311,13 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
-
+// 在 fork() 中拷贝父进程的 VMA
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      np->vmas[i] = p->vmas[i];
+      filedup(np->vmas[i].vfile); // 增加引用计数
+    }
+  }
   pid = np->pid;
 
   release(&np->lock);
@@ -343,7 +358,39 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+// 在 exit() 中写回 MAP_SHARED 修改过的脏页并关闭文件
+  for(int i = 0; i < NVMA; i++){
+  if(p->vmas[i].used){
+    uint64 old_vma_addr = p->vmas[i].addr;
+    for(uint64 a = p->vmas[i].addr; a < p->vmas[i].addr + p->vmas[i].len; a += PGSIZE){
+      pte_t *pte = walk(p->pagetable, a, 0);
+      if(pte && (*pte & PTE_V)){
+        // 检查是否为 MAP_SHARED、可写且被修改过 (PTE_D)
+        if((p->vmas[i].flags & MAP_SHARED) && p->vmas[i].vfile->writable && (*pte & PTE_D)){
+          uint64 va_off = a - old_vma_addr;
+          uint64 write_len = PGSIZE;
+          if(va_off + write_len > p->vmas[i].len){
+            write_len = p->vmas[i].len - va_off;
+          }
 
+          uint64 pa = PTE2PA(*pte); // 获取物理地址
+
+          begin_op();
+          ilock(p->vmas[i].vfile->ip);
+          // src_is_user 设为 0，直接传入内核物理地址 pa
+          writei(p->vmas[i].vfile->ip, 0, pa, p->vmas[i].offset + va_off, write_len);
+          iunlock(p->vmas[i].vfile->ip);
+          end_op();
+
+          *pte &= ~PTE_D; // 清除脏位
+        }
+        uvmunmap(p->pagetable, a, 1, 1);
+      }
+    }
+    fileclose(p->vmas[i].vfile);
+    p->vmas[i].used = 0;
+  }
+}
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
